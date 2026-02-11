@@ -281,7 +281,7 @@ def create_animation(data):
     scene = bpy.context.scene
     scene.frame_start = 0
     scene.frame_end = data.num_frames-1
-    scene.render.fps = data.fps
+    scene.render.fps = int(data.fps)
     scene.frame_set(0)
 
     utils.setModeToObject()
@@ -353,8 +353,7 @@ def validate(data):
                 break
         if(fitting):
             return True
-        print("animation bones not matching active armature")
-        return False
+        raise Exception("animation bones not matching active armature")
 
 class AnimationImporter():
     def loadAnimation(self, filePath):
@@ -386,7 +385,7 @@ class AnimationImporter():
 
 class ALA_Importer(bpy.types.Operator):
     """ALA Importer"""      # blender will use this as a tooltip for menu items and buttons.
-    bl_idname = "import.ala"        # unique identifier for buttons and menu items to reference.
+    bl_idname = "import_anim.ala"        # unique identifier for buttons and menu items to reference.
     bl_label = "Import ALA File"         # display name in the interface.
     bl_options = {'REGISTER', 'UNDO'}  # enable undo for the operator.
     filename_ext = ".ala"

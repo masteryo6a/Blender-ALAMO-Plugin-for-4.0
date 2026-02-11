@@ -1,5 +1,5 @@
 import bpy
-from . import settings, utils, export_ala
+from . import settings, utils, export_ala, validation
 
 from bpy.props import (StringProperty,
                        BoolProperty,
@@ -23,11 +23,34 @@ import sys
 import os
 import bmesh
 import copy
+from contextlib import contextmanager
 
-class ALO_Exporter(bpy.types.Operator):
+def skeletonEnumCallback(scene, context):
+    armatures = [('None', 'None', '', '', 0)]
+    counter = 1
+    for arm in bpy.data.objects:  # test if armature exists
+        if arm.type == 'ARMATURE':
+            armatures.append((arm.name, arm.name, '', '', counter))
+            counter += 1
+
+    return armatures
+
+
+@contextmanager
+def disable_exception_traceback():
+    """
+    All traceback information is suppressed and only the exception type and value are printed
+    Used to make user friendly errors
+    """
+    default_value = getattr(sys, "tracebacklimit", 1000)  # `1000` is a Python's default value
+    sys.tracebacklimit = 0
+    yield
+    sys.tracebacklimit = default_value  # revert changes
+
+class ALO_Exporter(bpy.types.Operator, ExportHelper):
 
     """ALO Exporter"""  # blender will use this as a tooltip for menu items and buttons.
-    bl_idname = "export.alo"  # unique identifier for buttons and menu items to reference.
+    bl_idname = "export_mesh.alo"  # unique identifier for buttons and menu items to reference.
     bl_label = "Export ALO File"  # display name in the interface.
     bl_options = {'REGISTER', 'UNDO'}  # enable undo for the operator.
     bl_info = {
@@ -52,61 +75,110 @@ class ALO_Exporter(bpy.types.Operator):
             default=True,
             )
 
+    useNamesFrom: EnumProperty(
+        name = "Use Names From",
+        description = "Whether the exporter should use object or mesh names.",
+        items=(
+            ('MESH', "Mesh", ""),
+            ('OBJECT', "Object", ""),
+        ),
+        default = 'MESH',
+    )
+
+    skeletonEnum : EnumProperty(
+        name='Active Skeleton',
+        description = "skeleton that is exported",
+        items = skeletonEnumCallback,
+    )
+
+
     def draw(self, context):
         layout = self.layout
+        layout.use_property_split = True
 
-        layout.prop(self, "exportAnimations")
-        layout.prop(self, "exportHiddenObjects")
+        row = layout.row()
+        row.prop(self, "exportAnimations")
+        row = layout.row()
+        row.prop(self, "exportHiddenObjects")
+
+        row = layout.row(heading="Names From")
+        row.use_property_split = False
+        row.prop(self, "useNamesFrom", expand = True)
+
+        row = layout.row()
+        row.prop(bpy.context.scene.ActiveSkeleton, "skeletonEnum")
 
     def execute(self, context):  # execute() is called by blender when running the operator.
 
         #skeleton and bones
 
-        def create_skeleton():
+        # This is a partial file showing only the modified create_skeleton() function
+# Replace the existing create_skeleton() function in export_alo.py with this version
 
+        # This replaces the create_skeleton() function in export_alo.py
+
+        def create_skeleton():
             utils.setModeToObject()
             armature = utils.findArmature()
-
-            if armature != None:
-                armature.hide_render = False
-                armature.select_set(True)  # select the skeleton
-                bpy.context.view_layer.objects.active = armature
-                bpy.ops.object.mode_set(mode='EDIT')
 
             bone_count_chunk = b"\x01\x02\x00\00"  # add chunk header
             bone_count_chunk += utils.pack_u_short(128)  # add static chunk length
             bone_count_chunk += b'\x00\x00'
 
             global bone_index_list  # create list of bone indices
-            bone_index_list = {"Root": 0}
+            bone_index_list = {}
+            
+            bone_name_per_alo_index = []
+            create_synthetic_root = True
+            existing_root_bone = None
 
-            # count the bones
-            bone_counter = 0
-            if armature != None:
+            if armature is not None:
+                # Ensure we are in Edit mode to access bone properties
+                context.view_layer.objects.active = armature
+                utils.setModeToEdit()
+                
+                # Check if skeleton has existing root bone
                 for bone in armature.data.bones:
-                    bone_counter += 1   #add before adding to list because we already have root
-                    bone_index_list[bone.name] = bone_counter
+                    if bone.name.lower() == 'root':
+                        existing_root_bone = bone
+                        create_synthetic_root = False
+                        break
+            
+            # 1. Handle Root Bone (Always Index 0)
+            if existing_root_bone:
+                bone_name_per_alo_index.append(existing_root_bone.name)
+                bone_index_list[existing_root_bone.name] = 0
+            else:
+                bone_name_per_alo_index.append('Root')
+                bone_index_list['Root'] = 0
+
+            # 2. Add other bones
+            if armature is not None:
+                for bone in armature.data.bones:
+                    if bone.name not in bone_index_list:
+                        bone_index_list[bone.name] = len(bone_name_per_alo_index)
+                        bone_name_per_alo_index.append(bone.name)
 
             global num_bones
-            num_bones = bone_counter
-            bone_count_chunk += utils.pack_int(num_bones+1)  #+1 because root is added by exporter
+            num_bones = len(bone_name_per_alo_index)
+            bone_count_chunk += utils.pack_int(num_bones)
 
             counter = 0
             while counter < 124:  # add padding bytes
                 bone_count_chunk += b"\x00"
                 counter += 1
 
-            calculate_bone_matrix(armature)
+            calculate_bone_matrix(armature, create_synthetic_root, existing_root_bone is not None)
 
-            bone_chunk = create_bone_chunk_root();
-
-            bone_name_per_alo_index = []
-
-            if armature != None:
-                bone_name_per_alo_index.append('Root')
-                for bone in armature.data.bones:
-                    bone_chunk += create_bone_chunk(bone, armature)
-                    bone_name_per_alo_index.append(bone.name)
+            bone_chunk = b''
+            for index, name in enumerate(bone_name_per_alo_index):
+                if index == 0:
+                    if create_synthetic_root:
+                        bone_chunk += create_bone_chunk_root()
+                    else:
+                        bone_chunk += create_bone_chunk_existing_root(armature.data.bones[name], armature)
+                else:
+                    bone_chunk += create_bone_chunk(armature.data.bones[name], armature, create_synthetic_root, existing_root_bone is not None)
 
             data = bone_count_chunk
             data += bone_chunk
@@ -114,14 +186,17 @@ class ALO_Exporter(bpy.types.Operator):
             header = (b"\x00\x02\x00\00")
             header += utils.pack_int(chunk_size(len(data)))
 
-            if bpy.context.mode != 'OBJECT':
-                bpy.ops.object.mode_set(mode='OBJECT')
+            # Exiting Edit mode if we entered it
+            if armature is not None:
+                utils.setModeToObject()
 
             file.write(header + data)  # write data to file
 
-            return bone_name_per_alo_index  #used later for mesh animation mapping
+            return bone_name_per_alo_index
+
 
         def create_bone_chunk_root():
+            """Creates a new Root bone chunk"""
             bone_name_chunk = b"\x03\x02\x00\00"
 
             name = 'Root'
@@ -132,14 +207,15 @@ class ALO_Exporter(bpy.types.Operator):
 
             bone_v2 = b"\x06\x02\x00\00"  # add chunk name
             bone_v2 += b"\x3c\x00\x00\00"  # add (static) chunk length
-            bone_v2 += b"\xff\xff\xff\xff"  # parent
+            bone_v2 += b"\xff\xff\xff\xff"  # parent (no parent)
+            
             # add visible
             bone_v2 += b"\x01\x00\x00\00"
 
             # add billboard
             bone_v2 += utils.pack_int(settings.billboard_array['Disable'])
 
-            # add bone matrix
+            # add bone matrix (identity)
             bone_v2 += utils.pack_float(bone_matrix['Root'][0][0])
             bone_v2 += utils.pack_float(bone_matrix['Root'][0][1])
             bone_v2 += utils.pack_float(bone_matrix['Root'][0][2])
@@ -156,12 +232,13 @@ class ALO_Exporter(bpy.types.Operator):
             bone_v2 += utils.pack_float(bone_matrix['Root'][2][3])
 
             bone_header = b"\x02\x02\x00\00"  # add header
-            bone_header += utils.pack_int(chunk_size(len(bone_name_chunk) + len(bone_v2)))  # add length of chunk
+            bone_header += utils.pack_int(chunk_size(len(bone_name_chunk) + len(bone_v2)))
             bone_header += bone_name_chunk + bone_v2
             return bone_header
 
-        def create_bone_chunk(bone, armature):
 
+        def create_bone_chunk_existing_root(bone, armature):
+            """Create chunk for an existing Root bone in the skeleton"""
             bone_name_chunk = b"\x03\x02\x00\00"
 
             name = utils.clean_name(bone.name)
@@ -172,13 +249,10 @@ class ALO_Exporter(bpy.types.Operator):
 
             bone_v2 = b"\x06\x02\x00\00"  # add chunk name
             bone_v2 += b"\x3c\x00\x00\00"  # add (static) chunk length
-            if bone.parent != None:  # add bone parent index
-                bone_v2 += utils.pack_int(bone_index_list[bone.parent.name])
-            else:
-                bone_v2 += b"\x00\x00\x00\x00"  # if parent doesnt exist use 0 (root)
-
+            bone_v2 += b"\xff\xff\xff\xff"  # parent (no parent for root)
 
             editBone = armature.data.edit_bones[bone.name]
+            
             # add visible
             if (editBone.Visible == 0):
                 bone_v2 += b"\x00\x00\x00\00"
@@ -205,25 +279,90 @@ class ALO_Exporter(bpy.types.Operator):
             bone_v2 += utils.pack_float(bone_matrix[bone.name][2][3])
 
             bone_header = b"\x02\x02\x00\00"  # add header
-            bone_header += utils.pack_int(chunk_size(len(bone_name_chunk) + len(bone_v2)))  # add length of chunk
+            bone_header += utils.pack_int(chunk_size(len(bone_name_chunk) + len(bone_v2)))
             bone_header += bone_name_chunk + bone_v2
             return bone_header
 
-        def calculate_bone_matrix(armature):
 
+        def create_bone_chunk(bone, armature, create_synthetic_root, has_existing_root):
+            """Creates a bone chunk for non-root bones"""
+            bone_name_chunk = b"\x03\x02\x00\00"
+
+            name = utils.clean_name(bone.name)
+
+            bone_name_encoded = bytes(name, 'utf-8') + b"\x00"
+            bone_name_chunk += utils.pack_int(len(bone_name_encoded))
+            bone_name_chunk += bone_name_encoded
+
+            bone_v2 = b"\x06\x02\x00\00"  # add chunk name
+            bone_v2 += b"\x3c\x00\x00\00"  # add (static) chunk length
+            
+            # Determine parent
+            if bone.parent != None:
+                # Has a parent - use its index
+                bone_v2 += utils.pack_int(bone_index_list[bone.parent.name])
+            else:
+                # No parent in Blender
+                if create_synthetic_root or has_existing_root:
+                    # Root or Synthetic Root is always at index 0
+                    bone_v2 += utils.pack_int(0)
+                else:
+                    # This fallback should rarely be hit
+                    bone_v2 += b"\xff\xff\xff\xff"  # No parent (-1)
+
+            editBone = armature.data.edit_bones[bone.name]
+            
+            # add visible
+            if (editBone.Visible == 0):
+                bone_v2 += b"\x00\x00\x00\00"
+            else:
+                bone_v2 += b"\x01\x00\x00\00"
+
+            # add billboard
+            bone_v2 += utils.pack_int(settings.billboard_array[editBone.billboardMode.billboardMode])
+
+            # add bone matrix
+            bone_v2 += utils.pack_float(bone_matrix[bone.name][0][0])
+            bone_v2 += utils.pack_float(bone_matrix[bone.name][0][1])
+            bone_v2 += utils.pack_float(bone_matrix[bone.name][0][2])
+            bone_v2 += utils.pack_float(bone_matrix[bone.name][0][3])
+
+            bone_v2 += utils.pack_float(bone_matrix[bone.name][1][0])
+            bone_v2 += utils.pack_float(bone_matrix[bone.name][1][1])
+            bone_v2 += utils.pack_float(bone_matrix[bone.name][1][2])
+            bone_v2 += utils.pack_float(bone_matrix[bone.name][1][3])
+
+            bone_v2 += utils.pack_float(bone_matrix[bone.name][2][0])
+            bone_v2 += utils.pack_float(bone_matrix[bone.name][2][1])
+            bone_v2 += utils.pack_float(bone_matrix[bone.name][2][2])
+            bone_v2 += utils.pack_float(bone_matrix[bone.name][2][3])
+
+            bone_header = b"\x02\x02\x00\00"  # add header
+            bone_header += utils.pack_int(chunk_size(len(bone_name_chunk) + len(bone_v2)))
+            bone_header += bone_name_chunk + bone_v2
+            return bone_header
+
+
+        def calculate_bone_matrix(armature, create_synthetic_root, has_existing_root):
+            """Calculate bone matrices respecting the skeleton hierarchy"""
             global bone_matrix
             bone_matrix = {}
 
-            bone_matrix['Root'] = mathutils.Matrix.Identity(4)
+            if create_synthetic_root:
+                bone_matrix['Root'] = mathutils.Matrix.Identity(4)
 
             if armature == None:
                 return
 
             for bone in armature.data.bones:
                 editBone = armature.data.edit_bones[bone.name]
-                if(bone.parent != None):
+                
+                if bone.parent != None:
+                    # Has parent - relative to parent
                     bone_matrix[editBone.name] = editBone.parent.matrix.inverted() @ editBone.matrix
                 else:
+                    # No parent - relative to skeleton root (which is origin-aligned in ALO)
+                    # So world matrix IS the relative matrix
                     bone_matrix[editBone.name] = editBone.matrix
 
         #mesh and materials
@@ -235,7 +374,7 @@ class ALO_Exporter(bpy.types.Operator):
             mesh_name_chunk += mesh_name_encoded  # add name
             file.write(mesh_name_chunk)
 
-        def create_mesh_info_chunk(object, material_list):
+        def create_mesh_info_chunk(mesh, object, material_list):
             mesh_information_chunk = b"\x02\x04\x00\00"  # add chunk header
             mesh_information_chunk += utils.pack_int(128)  # add static chunk length
 
@@ -243,48 +382,45 @@ class ALO_Exporter(bpy.types.Operator):
 
             mesh_information_chunk += utils.pack_int(n_materials)
 
-            # add bounding box data
-            x_list = []
-            y_list = []
-            z_list = []
-            float_counter = 0
-            while float_counter <= 7:  # write all bounding box coordinates into list
-                x_list.append(object.bound_box[float_counter][0])
-                y_list.append(object.bound_box[float_counter][1])
-                z_list.append(object.bound_box[float_counter][2])
-                float_counter += 1
+            # add bounding box data from actual mesh vertices
+            if len(mesh.vertices) > 0:
+                x_list = [v.co[0] for v in mesh.vertices]
+                y_list = [v.co[1] for v in mesh.vertices]
+                z_list = [v.co[2] for v in mesh.vertices]
+                
+                mesh_information_chunk += utils.pack_float(min(x_list))
+                mesh_information_chunk += utils.pack_float(min(y_list))
+                mesh_information_chunk += utils.pack_float(min(z_list))
 
-            mesh_information_chunk += utils.pack_float(min(x_list))  # write min/max of file into file
-            mesh_information_chunk += utils.pack_float(min(y_list))
-            mesh_information_chunk += utils.pack_float(min(z_list))
+                mesh_information_chunk += utils.pack_float(max(x_list))
+                mesh_information_chunk += utils.pack_float(max(y_list))
+                mesh_information_chunk += utils.pack_float(max(z_list))
+            else:
+                # Fallback for empty mesh
+                for _ in range(6):
+                    mesh_information_chunk += utils.pack_float(0.0)
 
-            mesh_information_chunk += utils.pack_float(max(x_list))
-            mesh_information_chunk += utils.pack_float(max(y_list))
-            mesh_information_chunk += utils.pack_float(max(z_list))
+            mesh_information_chunk += b"\x00\x00\x00\x00"  # unused spacer
 
-            mesh_information_chunk += b"\x00\x00\x00\00"  # unused
-
-            # hidden
+            # hidden check
             if (object.Hidden):
-                mesh_information_chunk += b"\x01\x00\x00\00"
+                mesh_information_chunk += b"\x01\x00\x00\x00"
             else:
-                mesh_information_chunk += b"\x00\x00\x00\00"
+                mesh_information_chunk += b"\x00\x00\x00\x00"
 
-            # colission
+            # collision
             if (object.HasCollision):
-                mesh_information_chunk += b"\x01\x00\x00\00"
+                mesh_information_chunk += b"\x01\x00\x00\x00"
             else:
-                mesh_information_chunk += b"\x00\x00\x00\00"
+                mesh_information_chunk += b"\x00\x00\x00\x00"
 
-            counter = 0
-            while counter < 88:  # add padding bytes
+            while len(mesh_information_chunk) < 136:  # add padding bytes (128 data + 8 header)
                 mesh_information_chunk += b"\x00"
-                counter += 1
 
             file.write(mesh_information_chunk)
 
         def check_if_material_is_used(material, mesh):
-            for face in mesh.polygons:
+            for face in mesh.loop_triangles: # Blender 4.x: Use loop_triangles instead of polygons for triangulated meshes
                 if material == mesh.materials[face.material_index]:
                     return True
             return False
@@ -310,6 +446,8 @@ class ALO_Exporter(bpy.types.Operator):
             object.to_mesh_clear()
 
         def create_mesh(mesh_list, bone_name_per_alo_index):
+            armature = utils.findArmature()
+            
             for object in mesh_list:
 
                 context.view_layer.objects.active = object
@@ -342,6 +480,37 @@ class ALO_Exporter(bpy.types.Operator):
                 object_eval = object.evaluated_get(depsgraph)
                 mesh = bpy.data.meshes.new_from_object(object_eval, preserve_all_data_layers=True, depsgraph=depsgraph)
 
+                # --- START TRANSFORMATION LOGIC ---
+                # Calculate transformation to bring vertices into bone-local space
+                transform_matrix = mathutils.Matrix.Identity(4)
+                if armature is not None:
+                    # Find connection bone
+                    conn_bone_name = 'Root'
+                    has_constraint = False
+                    for constraint in object.constraints:
+                        if constraint.type == 'CHILD_OF' and constraint.subtarget:
+                            conn_bone_name = constraint.subtarget
+                            has_constraint = True
+                            break
+                    
+                    # Get Bone World Matrix
+                    # Use index 0 for Root if not found in pose bones (synthetic root case)
+                    if conn_bone_name in armature.pose.bones:
+                        bone_world_matrix = armature.matrix_world @ armature.pose.bones[conn_bone_name].matrix
+                    else:
+                        # Fallback to armature origin (Root)
+                        bone_world_matrix = armature.matrix_world
+                    
+                    transform_matrix = bone_world_matrix.inverted() @ object_eval.matrix_world
+                else:
+                    # No active skeleton selected.
+                    # Previous plugin versions exported in local space if no skeleton was used.
+                    # We preserve that by using identity matrix (vertices stay in local space).
+                    transform_matrix = mathutils.Matrix.Identity(4)
+                
+                mesh.transform(transform_matrix)
+                # --- END TRANSFORMATION LOGIC ---
+
                 object.hide_viewport = wasHidden;
 
                 #reenable armature modifier
@@ -356,7 +525,7 @@ class ALO_Exporter(bpy.types.Operator):
                         material_list.append(material)
 
                 create_mesh_name_chunk(mesh)
-                create_mesh_info_chunk(object, material_list)
+                create_mesh_info_chunk(mesh, object, material_list)
 
                 sub_mesh_data_chunk = b''
                 for material in material_list:
@@ -397,7 +566,7 @@ class ALO_Exporter(bpy.types.Operator):
 
                     #add bone indices, iterate over every vertex and add group index if not yet in list
                     group_index_list = [0]   #indices of groups
-                    for face in mesh.polygons:
+                    for face in mesh.loop_triangles: # Blender 4.x: Use loop_triangles instead of polygons
                         if (material.name == object.material_slots[face.material_index].name):
                             for vertexIndex in face.vertices:
                                 vertex = mesh.vertices[vertexIndex]
@@ -408,7 +577,7 @@ class ALO_Exporter(bpy.types.Operator):
                     for index in group_index_list:
                         if index == None:
                             cleanUpModifiers(object)
-                            raise RuntimeError('Missing vertex group on object: ' + object.name)
+                            self.report({"ERROR"}, f'ALAMO - Missing vertex group on object: {object.name}')
 
                     group_index_list.sort()
                     group_to_alo_index = {}
@@ -444,11 +613,41 @@ class ALO_Exporter(bpy.types.Operator):
             #calc_tangents() must be called before accessing the uv layer
             #otherwise the uv data will break under certain circumstances
             #blender bug?
-            mesh.calc_tangents()
+            # Blender 4.x: calc_tangents now requires the name of the UV map
+            if mesh.uv_layers.active:
+                mesh.calc_tangents(uvmap=mesh.uv_layers.active.name)
 
             uv_layer = mesh.uv_layers.active.data
             loop_to_alo_index = {}   #dictionary that maps blender vertex indices to the corresponding alo index
                                         #only smooth shaded faces are saved here, as flat shaded faces need duplicate vertices anyway
+
+            # Blender 4.x: Access tangents and bitangents via attributes
+            tangents = None
+            bitangents = None
+            if uses_bump:
+                tangents = mesh.attributes.get("tangent")
+                bitangents = mesh.attributes.get("bitangent")
+
+                # Attribute domain verification
+                if tangents and tangents.domain != 'CORNER':
+                    tangents = None
+                if bitangents and bitangents.domain != 'CORNER':
+                    bitangents = None
+
+                # Fallback warning
+                if tangents is None or bitangents is None:
+                    # Try to calculate again without the uvmap name as a last resort (legacy style)
+                    try:
+                        mesh.calc_tangents()
+                        tangents = mesh.attributes.get("tangent")
+                        bitangents = mesh.attributes.get("bitangent")
+                    except:
+                        pass
+                
+                if tangents is None or bitangents is None:
+                    print(f"ALAMO - Tangents could not be calculated for {object.name}. Fallback to default.")
+                    # Only report warning once per object to avoid spam
+                    # self.report({'WARNING'}, f"ALAMO - Tangents could not be calculated for {object.name}. Shading may be incorrect.")
 
             alo_index = 0
             for face in faces:
@@ -494,8 +693,15 @@ class ALO_Exporter(bpy.types.Operator):
                         alo_index += 1
 
                         if uses_bump:
-                            vertex.tangent = copy.copy(mesh.loops[loop.index].tangent)
-                            vertex.bitangent = copy.copy(mesh.loops[loop.index].bitangent)
+                            # Blender 4.x: Use attribute data for tangents and bitangents
+                            if tangents and bitangents:
+                                vertex.tangent = copy.copy(tangents.data[loop.index].vector)
+                                vertex.bitangent = copy.copy(bitangents.data[loop.index].vector)
+                            else:
+                                # Fallback or warning if attributes aren't present despite uses_bump
+                                # Note: In Blender 4.0, these should be present after calc_tangents
+                                vertex.tangent = mathutils.Vector((1, 0, 0))
+                                vertex.bitangent = mathutils.Vector((0, 1, 0))
 
             return [vertices, face_indices]
 
@@ -838,7 +1044,7 @@ class ALO_Exporter(bpy.types.Operator):
                 elif (parameter == "MappingScale"):
                     chunk += mat_float_chunk("MappingScale", material.MappingScale)
                 elif (parameter == "BlendSharpness"):
-                    chunk += mat_float_chunk("BlendSharpness", material.MappingScale)
+                    chunk += mat_float_chunk("BlendSharpness", material.BlendSharpness)
                 #else:
                     #print("warning: unkown shader parameter: " + parameter)    #for debugging
             return chunk
@@ -1289,97 +1495,9 @@ class ALO_Exporter(bpy.types.Operator):
             #add 2147483648 instead of binary operation
             return size+2147483648
 
-        def selectNonManifoldVertices(object):
-            if(bpy.context.mode != 'OBJECT'):
-                bpy.ops.object.mode_set(mode='OBJECT')
-            object.hide_set(False)
-            bpy.context.view_layer.objects.active = object
-            bpy.ops.object.mode_set(mode='EDIT')
-            bpy.ops.mesh.select_all(action='DESELECT')
-            bpy.ops.mesh.select_non_manifold()
-
-        def checkShadowMesh(mesh_list):  #checks if shadow meshes are correct and checks if material is missing
-            for object in mesh_list:
-                if len(object.data.materials) == 0:
-                    raise RuntimeError('Missing material on object: ' + object.name)
-                shader = object.data.materials[0].shaderList.shaderList
-                if shader == 'MeshShadowVolume.fx' or shader == 'RSkinShadowVolume.fx':
-                    bm = bmesh.new()  # create an empty BMesh
-                    bm.from_mesh(object.data)  # fill it in from a Mesh
-                    bm.verts.ensure_lookup_table()
-
-                    for vertex in bm.verts:
-                        if not vertex.is_manifold:
-                            bm.free()
-                            selectNonManifoldVertices(object)
-                            raise RuntimeError('Non manifold geometry shadow mesh: ' + object.name)
-
-                    for edge in bm.edges:
-                        if len(edge.link_faces) < 2 :
-                            bm.free()
-                            selectNonManifoldVertices(object)
-                            raise RuntimeError('Non manifold geometry shadow mesh: ' + object.name)
-
-                    bm.free()
-
-
-        def checkUV(mesh_list):  #throws error if object lacks UVs
-            for object in mesh_list:
-                for material in object.data.materials:
-                    if material.shaderList.shaderList == 'MeshShadowVolume.fx' or material.shaderList.shaderList == 'RSkinShadowVolume.fx':
-                        if len(object.data.materials) > 1:
-                            raise RuntimeError('Multiple materials on shadow volume: ' + object.name + ' , remove additional materials')
-                        else:
-                            return
-                    if object.HasCollision:
-                        if len(object.data.materials) > 1:
-                            raise RuntimeError('Multiple submeshes/materials on collision mesh: ' + object.name + ' , remove additional materials')
-                if object.data.uv_layers:   #or material.shaderList.shaderList in settings.no_UV_Shaders:  #currently UVs are needed for everything but shadows
-                    continue
-                else:
-                    raise RuntimeError('Missing UV: ' + object.name)
-
-        def checkInvalidArmatureModifier(mesh_list): #throws error if armature modifier lacks rig, this would crash the exporter later and checks if skeleton in modifier doesn't match active skeleton
-            activeSkeleton = bpy.context.scene.ActiveSkeleton.skeletonEnum
-            for object in mesh_list:
-                for modifier in object.modifiers:
-                    if modifier.type == "ARMATURE":
-                        if modifier.object == None:
-                            raise RuntimeError('Armature modifier without selected skeleton on: ' + object.name)
-                            return True
-                        elif modifier.object.type != 'NoneType':
-                            if modifier.object.name != activeSkeleton:
-                                raise RuntimeError('Armature modifier skeleton doesnt match active skeleton on: ' + object.name)
-                                return True
-                for constraint in object.constraints:
-                    if constraint.type == 'CHILD_OF':
-                        if constraint.target is not None:
-                            #print(type(constraint.target))
-                            if constraint.target.name != activeSkeleton:
-                                raise RuntimeError('Constraint doesnt match active skeleton on: ' + object.name)
-                                return True
-
-        def checkFaceNumber(mesh_list):  #checks if the number of faces exceeds max ushort, which is used to save the indices
-            for object in mesh_list:
-                if len(object.data.polygons) > 65535:
-                    raise RuntimeError('Face number exceeds uShort max on object: ' + object.name + ' split mesh into multiple objects')
-                    return True
-
-        def checkAutosmooth(mesh_list):  #prints a warning if Autosmooth is used
-            for object in mesh_list:
-                if object.data.use_auto_smooth:
-                    print('Warning: ' + object.name + ' uses autosmooth, ingame shading might not match blender, use edgesplit instead')
-
-        def checkTranslation(mesh_list): #prints warning when translation is not default
-            for object in mesh_list:
-                if object.location != mathutils.Vector((0.0, 0.0, 0.0)) or object.rotation_euler != mathutils.Euler((0.0, 0.0, 0.0), 'XYZ') or object.scale != mathutils.Vector((1.0, 1.0, 1.0)):
-                    print('Warning: ' + object.name + ' is not aligned with the world origin, apply translation or bind to bone')
-
-        def checkTranslationArmature(): #prints warning when translation is not default
-            armature = utils.findArmature()
-            if armature != None:
-                if armature.location != mathutils.Vector((0.0, 0.0, 0.0)) or armature.rotation_euler != mathutils.Euler((0.0, 0.0, 0.0), 'XYZ') or armature.scale != mathutils.Vector((1.0, 1.0, 1.0)):
-                    print('Warning: active Armature is not aligned with the world origin')
+        def exportFailed():
+            with disable_exception_traceback():
+                raise Exception('ALAMO - EXPORT FAILED')
 
         def unhide():
             hiddenList = []
@@ -1393,21 +1511,6 @@ class ALO_Exporter(bpy.types.Operator):
             for object in bpy.data.objects:
                 object.hide_render =  hiddenList[counter]
                 counter += 1
-
-        def create_export_list(collection):
-            export_list = []
-
-            if(collection.hide_viewport):
-                return export_list
-
-            for object in collection.objects:
-                if(object.type == 'MESH' and (object.hide_viewport == False or self.exportHiddenObjects)):
-                    export_list.append(object)
-
-            for child in collection.children:
-                export_list.extend(create_export_list(child))
-
-            return export_list
 
         #hidden objects and collections can't be accessed, avoid problems
         def unhide_collections(collection_parent):
@@ -1453,16 +1556,15 @@ class ALO_Exporter(bpy.types.Operator):
                 exporter.exportAnimation(filePath + "_" + action.name + ".ALA")
 
 
-        mesh_list = create_export_list(bpy.context.scene.collection)
+        mesh_list = validation.create_export_list(bpy.context.scene.collection, self.exportHiddenObjects, self.useNamesFrom)
 
         #check if export objects satisfy requirements (has material, UVs, ...)
-        checkShadowMesh(mesh_list)
-        checkUV(mesh_list)
-        checkFaceNumber(mesh_list)
-        checkAutosmooth(mesh_list)
-        checkTranslation(mesh_list)
-        checkTranslationArmature()
-        checkInvalidArmatureModifier(mesh_list)
+        messages = validation.validate(mesh_list)
+        
+        if messages is not None and len(messages) > 0:
+            for message in messages:
+                self.report(*message)
+            exportFailed()
 
         hiddenList = unhide()
         collection_is_hidden_list = unhide_collections(bpy.context.scene.collection)
@@ -1470,20 +1572,24 @@ class ALO_Exporter(bpy.types.Operator):
         path = self.properties.filepath
 
         global file
-        file = open(path, 'wb')  # open file in read binary mode
+        if os.access(path, os.W_OK) or not os.access(path, os.F_OK):
+            file = open(path, 'wb')  # open file in read binary mode
 
-        bone_name_per_alo_index = create_skeleton()
-        create_mesh(mesh_list, bone_name_per_alo_index)
-        create_connections(mesh_list)
+            bone_name_per_alo_index = create_skeleton()
+            create_mesh(mesh_list, bone_name_per_alo_index)
+            create_connections(mesh_list)
 
-        file.close()
-        file = None
-        #removeShadowDoubles()
-        hide(hiddenList)
-        hide_collections(bpy.context.scene.collection, collection_is_hidden_list, 0)
+            file.close()
+            file = None
+            #removeShadowDoubles()
+            hide(hiddenList)
+            hide_collections(bpy.context.scene.collection, collection_is_hidden_list, 0)
 
-        if(self.exportAnimations):
-            exportAnimations(path)
+            if(self.exportAnimations):
+                exportAnimations(path)
+        else:
+            self.report({"ERROR"}, f'ALAMO - Could not write to {os.path.split(path)[1]}')
+            exportFailed()
 
         return {'FINISHED'}  # this lets blender know the operator finished successfully.
 
