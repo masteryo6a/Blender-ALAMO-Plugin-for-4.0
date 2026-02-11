@@ -2,12 +2,20 @@
 
 A plugin that allow reading and writing of ALAMO-Engine model(.alo) and animation(.ala) files.  
 Specifically designed to work with Empire at War: Forces of Corruption.
+This was vibe-coded on top of https://github.com/AlamoEngine-Tools/Mirror-Blender-Alamo-Plugin
 
 # Getting Started 
 
-Tested with Blender 2.82. Download the repository. Put the "io_alamo_tools" folder into "Blender 2.82/2.82/scripts/addons/".  
+Ported for 4.0. Download the repository. Put the "io_alamo_tools" folder into Blender's addons folder.  
 The plugin has to be enabled in Blender. See the official [documentation](https://docs.blender.org/manual/en/latest/editors/preferences/addons.html).  
 If everything worked the Import and Export menus now list options for .ALO and .ALA files.  
+.ALA not tested.
+
+# New feature
+
+Automatic baking of .dds textures for single or multiple meshes using Texconv. (either have the DDS Addon https://github.com/matyalatte/Blender-DDS-Addon/ or specify texconv file)
+Still has bugs. Not recommended to go above 2048x2048 in texture atlas mode for performance reasons.
+This creates .dds and .png files in your .blend file directory, you need to put the dds files in Data/Art/Textures next to your exported .alo.
 
 ## Supported formats 
 
