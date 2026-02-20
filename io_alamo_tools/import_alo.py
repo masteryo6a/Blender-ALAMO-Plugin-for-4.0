@@ -441,87 +441,87 @@ class ALO_Importer(bpy.types.Operator):
             return animation_mapping
 
         def set_up_textures(material):
-
             material.use_nodes = True
             nt = material.node_tree
             nodes = nt.nodes
             links = nt.links
 
-            # clean up existing nodes
+            # Clean up existing nodes
             while nodes:
                 nodes.remove(nodes[0])
 
-            # Output and main shader
+            # Create Output and Principled BSDF
             output = nodes.new("ShaderNodeOutputMaterial")
-            output.location = (300.0, 0.0)
-
+            output.location = (400, 100)
+            
             bsdf = nodes.new("ShaderNodeBsdfPrincipled")
-            bsdf.location = (0.0, 0.0)
+            bsdf.location = (100, 100)
             links.new(bsdf.outputs["BSDF"], output.inputs["Surface"])
 
-            # Base color texture (if present)
-            base_tex_node = None
+            # 1. Base Color Texture
             base_name = getattr(material, "BaseTexture", "None")
             if base_name != "None" and base_name in bpy.data.images:
-                base_tex_node = nodes.new("ShaderNodeTexImage")
-                base_tex_node.location = (-400.0, 0.0)
-                base_tex_node.image = bpy.data.images[base_name]
-                base_tex_node.image.alpha_mode = 'CHANNEL_PACKED'
-                links.new(base_tex_node.outputs["Color"], bsdf.inputs["Base Color"])
+                tex_node = nodes.new("ShaderNodeTexImage")
+                tex_node.name = "BaseColorNode"
+                tex_node.location = (-300, 200)
+                tex_node.image = bpy.data.images[base_name]
+                # Set Alpha to Channel Packed as requested
+                tex_node.image.alpha_mode = 'CHANNEL_PACKED'
+                links.new(tex_node.outputs["Color"], bsdf.inputs["Base Color"])
 
-            # Normal map (if present)
-            normal_name = getattr(material, "NormalTexture", "None")
-            if normal_name != "None" and normal_name in bpy.data.images:
-                normal_tex = nodes.new("ShaderNodeTexImage")
-                normal_tex.location = (-600.0, -200.0)
-                normal_tex.image = bpy.data.images[normal_name]
-                # Blender 4.x: use 'Non-Color' color space for normal maps
-                normal_tex.image.colorspace_settings.name = 'Non-Color'
+            # 2. Normal Texture
+            norm_name = getattr(material, "NormalTexture", "None")
+            if norm_name != "None" and norm_name in bpy.data.images:
+                norm_tex = nodes.new("ShaderNodeTexImage")
+                norm_tex.location = (-600, -100)
+                norm_tex.image = bpy.data.images[norm_name]
+                norm_tex.image.colorspace_settings.name = 'Non-Color'
 
-                normal_map = nodes.new("ShaderNodeNormalMap")
-                normal_map.location = (-300.0, -200.0)
+                norm_map = nodes.new("ShaderNodeNormalMap")
+                norm_map.location = (-250, -100)
+                
+                links.new(norm_tex.outputs["Color"], norm_map.inputs["Color"])
+                links.new(norm_map.outputs["Normal"], bsdf.inputs["Normal"])
 
-                links.new(normal_tex.outputs["Color"], normal_map.inputs["Color"])
-                links.new(normal_map.outputs["Normal"], bsdf.inputs["Normal"])
-
-            # Basic alpha / additive handling based on shader name
+            # Transparency Handling for specific shaders
             shader_name = ""
-            if hasattr(material, "shaderList") and hasattr(material.shaderList, "shaderList"):
+            if hasattr(material, "shaderList"):
                 shader_name = material.shaderList.shaderList
 
-            if "Additive" in shader_name or "Alpha" in shader_name:
-                material.blend_method = "BLEND"
-                if base_tex_node is not None and "Alpha" in base_tex_node.outputs:
-                    # Feed texture alpha into BSDF alpha
-                    links.new(base_tex_node.outputs["Alpha"], bsdf.inputs["Alpha"])
+            if any(x in shader_name for x in ["Alpha", "Additive", "Cloud"]):
+                material.blend_method = 'BLEND'
+                material.shadow_method = 'HASHED'
 
         def create_material(currentSubMesh):
             if currentSubMesh.material.name != "DUMMYMATERIAL":
                 return
 
             oldMat = currentSubMesh.material
-
-            texName = currentSubMesh.material.BaseTexture
-            texName = texName[0:len(texName) - 4] + " Material"
-            if texName in bpy.data.materials and oldMat.shaderList.shaderList != bpy.data.materials.get(texName).shaderList.shaderList:
-                texName += "1"
-            mat = assign_material(texName)
-
+            texNameFull = getattr(oldMat, "BaseTexture", "None")
+            
+            # Create a unique name for the material based on the texture
+            mat_name = texNameFull.split('.')[0] + "_Mat" if texNameFull != "None" else "AlamoMaterial"
+            mat = assign_material(mat_name)
+            
+            # Copy properties from Dummy to Real Material
             mat.shaderList.shaderList = oldMat.shaderList.shaderList
+            material_props = ["BaseTexture", "NormalTexture", "GlossTexture", "Emissive", "Diffuse", "Specular", "Shininess"]
 
-            # TODO: Extract set_alamo_shader's shader finder to new function, use that here.
-            material_props = ["BaseTexture", "NormalTexture", "GlossTexture", "WaveTexture", "DistortionTexture", "CloudTexture", "CloudNormalTexture", "Emissive", "Diffuse", "Specular", "Shininess", "Colorization", "DebugColor", "UVOffset", "Color", "UVScrollRate", "DiffuseColor",
-                              "EdgeBrightness", "BaseUVScale", "WaveUVScale", "DistortUVScale", "BaseUVScrollRate", "WaveUVScrollRate", "DistortUVScrollRate", "BendScale", "Diffuse1", "CloudScrollRate", "CloudScale", "SFreq",  "TFreq", "DistortionScale", "Atmosphere", "CityColor", "AtmospherePower"]
+            for prop in material_props:
+                if prop in oldMat:
+                    mat[prop] = oldMat[prop]
 
-            for texture in material_props:
-                if texture in oldMat:
-                    mat[texture] = oldMat[texture]
-
+            # Assign to object
             obj = bpy.context.object
-
-            obj.data.materials.clear()
-            obj.data.materials.append(mat)
+            if obj:
+                # Replace the material slot
+                for i, slot in enumerate(obj.material_slots):
+                    if slot.material == oldMat:
+                        obj.data.materials[i] = mat
+            
             currentSubMesh.material = mat
+            # Now that properties are copied, build the nodes
+            set_up_textures(mat)
 
         def assign_material(name):
             if name in bpy.data.materials:
@@ -699,25 +699,61 @@ class ALO_Importer(bpy.types.Operator):
             return n_objects_proxies
 
         def read_conncetion(armatureData, meshNameList):
-            file.seek(2, 1)  # skip head and size
+            file.seek(2, 1)
             mesh_index = struct.unpack("I", file.read(4))[0]
-            file.seek(2, 1)  # skip head and size
+            file.seek(2, 1)
             bone_index = struct.unpack("I", file.read(4))[0]
-            armatureBlender = utils.findArmature()
 
-            # set connection of object to bone
-            obj = None
-            if mesh_index < len(meshNameList):  # light objects can mess this up
-                obj = bpy.data.objects[meshNameList[mesh_index]]
-            bone = armatureBlender.data.bones[bone_index]
+            armatureObj = utils.findArmature()
+            if armatureObj is None:
+                return
 
-            if obj is not None and bone.name != 'Root':
-                # Parent object directly to the bone; this keeps its current
-                # world transform as the local offset to the bone so it follows
-                # correctly when the bone animates.
-                obj.parent = armatureBlender
-                obj.parent_type = 'BONE'
-                obj.parent_bone = bone.name
+            if mesh_index >= len(meshNameList):
+                return
+
+            obj = bpy.data.objects.get(meshNameList[mesh_index])
+            if obj is None:
+                return
+
+            bone = armatureObj.data.bones[bone_index]
+            if bone.name == 'Root':
+                return
+
+            # ------------------------------------------------
+            # CHILD OF CONSTRAINT — NO INVERSE
+            # ------------------------------------------------
+
+            obj.parent = None
+
+            # Remove old constraints
+            for c in obj.constraints:
+                if c.type == 'CHILD_OF' and c.target == armatureObj:
+                    obj.constraints.remove(c)
+
+            constraint = obj.constraints.new('CHILD_OF')
+            constraint.name = "ALO_Bone_Attach"
+            constraint.target = armatureObj
+            constraint.subtarget = bone.name
+            constraint.target_space = 'POSE'
+            constraint.owner_space = 'WORLD'
+
+            bpy.context.view_layer.update()
+
+            # ------------------------------------------------
+            # SNAP INTO BONE SPACE (same as Clear Inverse)
+            # ------------------------------------------------
+
+            # Compute bone world matrix
+            bone_world = (
+                armatureObj.matrix_world @
+                armatureObj.pose.bones[bone.name].matrix
+            )
+
+            # Move mesh into that space
+            obj.data.transform(bone_world)
+
+            # Reset object transform to identity
+            obj.matrix_world = mathutils.Matrix.Identity(4)
 
         def read_proxy():
             chunk_length = struct.unpack("I", file.read(4))[0]
@@ -867,22 +903,55 @@ class ALO_Importer(bpy.types.Operator):
                 return path
 
         def load_image(texture_name):
-            if texture_name == 'None':
+            if texture_name == 'None' or not texture_name:
                 return
-            elif (texture_name in bpy.data.images):
-                img = bpy.data.images[texture_name]
-            else:
-                path = file.name
-                path = os.path.split(path)[0]
-                path = os.path.split(path)[0] + "/TEXTURES/" + texture_name
-                if self.properties.textureOverride != "NONE":
-                    path = textureOverride(path, self.properties.textureOverride, texture_name)
 
+            if texture_name in bpy.data.images:
+                return bpy.data.images[texture_name]
+
+            alo_path = os.path.abspath(file.name)
+            base_dir = os.path.dirname(alo_path)
+
+            # Normalize case for safety
+            texture_name = texture_name.replace("/", os.sep).replace("\\", os.sep)
+
+            search_paths = []
+
+            # 1. Same folder as .alo
+            search_paths.append(os.path.join(base_dir, texture_name))
+
+            # 2. ./TEXTURES/
+            search_paths.append(os.path.join(base_dir, "TEXTURES", texture_name))
+
+            # 3. ../TEXTURES/
+            search_paths.append(os.path.join(os.path.dirname(base_dir), "TEXTURES", texture_name))
+
+            # 4. ./data/art/textures  ← NEW
+            search_paths.append(os.path.join(base_dir, "data", "art", "textures", texture_name))
+
+            # 5. ../data/art/textures ← also useful for typical mod structure
+            search_paths.append(os.path.join(os.path.dirname(base_dir), "data", "art", "textures", texture_name))
+
+            # Optional Submod Override
+            if self.properties.textureOverride != "NONE":
+                override_paths = []
+                for path in search_paths:
+                    override_path = textureOverride(path, self.properties.textureOverride, texture_name)
+                    override_paths.append(override_path)
+                search_paths = override_paths + search_paths
+
+            # Try loading
+            for path in search_paths:
                 if os.path.isfile(path):
-                    img = bpy.data.images.load(path)
-                else:
-                    self.report({"WARNING"}, "ALAMO - Couldn't find texture: " + texture_name)
-                    return
+                    try:
+                        img = bpy.data.images.load(path)
+                        img.name = texture_name
+                        return img
+                    except:
+                        continue
+
+            self.report({"WARNING"}, f"ALAMO - Could not find texture: {texture_name}")
+            return None
 
         def validate_material_prop(name):
             material_props = ["BaseTexture", "NormalTexture", "GlossTexture", "WaveTexture", "DistortionTexture", "CloudTexture", "CloudNormalTexture", "Emissive", "Diffuse", "Specular", "Shininess", "Colorization", "DebugColor", "UVOffset", "Color", "UVScrollRate", "DiffuseColor",

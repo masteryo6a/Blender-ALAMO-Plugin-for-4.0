@@ -39,6 +39,8 @@ def prepare_object_for_bake(obj, uv_name="ALAMO_BAKE", resolution=1024):
 def prepare_objects_for_bake(objects, uv_name="ALAMO_BAKE_ATLAS", resolution=1024):
     """
     Joins multiple objects into a single mesh with unified UV atlas.
+    Each object's vertices are tagged with a named vertex group before joining
+    so they can be reliably separated back out afterward.
     Returns: (joined_object, metadata_for_separation)
     """
     if len(objects) == 1:
@@ -57,20 +59,24 @@ def prepare_objects_for_bake(objects, uv_name="ALAMO_BAKE_ATLAS", resolution=102
         new_obj = obj.copy()
         new_obj.data = obj.data.copy()
         bpy.context.collection.objects.link(new_obj)
-        new_obj.select_set(True)
         duplicates.append(new_obj)
         
-        # Store metadata
+        # Tag every vertex with a named group so we can find them after joining.
+        # We do this on the duplicate so the original is never touched.
+        group_name = f"BAKE_SOURCE_{obj.name}"
+        vg = new_obj.vertex_groups.new(name=group_name)
+        vg.add(list(range(len(new_obj.data.vertices))), 1.0, 'REPLACE')
+        
+        # Store metadata - group name is the reliable key, not vertex count
         metadata.append({
             'original_name': obj.name,
-            'duplicate': new_obj,
-            'vertex_count': len(new_obj.data.vertices)
+            'group_name': group_name,
         })
     
-    # Set active object to first duplicate
+    # Select all duplicates and join
+    for dup in duplicates:
+        dup.select_set(True)
     bpy.context.view_layer.objects.active = duplicates[0]
-    
-    # Join all duplicates into one
     bpy.ops.object.join()
     joined_obj = bpy.context.active_object
     
@@ -101,39 +107,71 @@ def prepare_objects_for_bake(objects, uv_name="ALAMO_BAKE_ATLAS", resolution=102
 
 def separate_baked_meshes(joined_obj, metadata, uv_name="ALAMO_BAKE_ATLAS"):
     """
-    Separates the joined object back into individual meshes.
+    Separates the joined object back into individual meshes using vertex groups
+    that were stamped onto each duplicate before joining. This is deterministic
+    regardless of whether meshes touch, overlap, or share vertex counts.
     Removes old UV maps, keeping only the baked atlas UV.
-    Returns: list of separated objects
+    Returns: list of separated objects in the same order as the original metadata.
     """
     if metadata is None:
-        # Single object mode - remove old UV maps
+        # Single object mode - just clean up old UV maps
         mesh = joined_obj.data
         uv_layers_to_remove = [uv for uv in mesh.uv_layers if uv.name != uv_name]
         for uv in uv_layers_to_remove:
             mesh.uv_layers.remove(uv)
         return [joined_obj]
     
-    # Select the joined object
-    bpy.ops.object.select_all(action='DESELECT')
-    joined_obj.select_set(True)
-    bpy.context.view_layer.objects.active = joined_obj
+    separated_objs = []
     
-    # Separate by loose parts
-    bpy.ops.object.mode_set(mode='EDIT')
-    bpy.ops.mesh.separate(type='LOOSE')
-    bpy.ops.object.mode_set(mode='OBJECT')
+    # Separate one object per metadata entry by selecting its vertex group.
+    # After each separate() the active object becomes the remainder, so we
+    # keep operating on whatever is still active.
+    current_obj = joined_obj
     
-    # Get all separated objects
-    separated_objs = [obj for obj in bpy.context.selected_objects if obj.type == 'MESH']
+    for i, meta in enumerate(metadata):
+        group_name = meta['group_name']
+        original_name = meta['original_name']
+        is_last = (i == len(metadata) - 1)
+        
+        bpy.ops.object.select_all(action='DESELECT')
+        current_obj.select_set(True)
+        bpy.context.view_layer.objects.active = current_obj
+        
+        if is_last:
+            # Nothing left to separate - the remainder IS this object
+            current_obj.name = original_name + "_Baked"
+            separated_objs.append(current_obj)
+        else:
+            # Select the vertices belonging to this object's group
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='DESELECT')
+            
+            # Activate the vertex group and select it
+            current_obj.vertex_groups.active = current_obj.vertex_groups[group_name]
+            bpy.ops.object.vertex_group_select()
+            
+            # Separate the selection into a new object
+            bpy.ops.mesh.separate(type='SELECTED')
+            bpy.ops.object.mode_set(mode='OBJECT')
+            
+            # After separate(), context.selected_objects contains both pieces.
+            # The newly separated piece is the one that is NOT the active object.
+            new_obj = next(
+                o for o in bpy.context.selected_objects
+                if o != bpy.context.active_object
+            )
+            new_obj.name = original_name + "_Baked"
+            separated_objs.append(new_obj)
+            
+            # The active object is the remainder - continue with it
+            current_obj = bpy.context.active_object
     
-    # Try to match original names based on vertex count
-    # This is a heuristic - may need refinement for complex cases
+    # Clean up: remove BAKE_SOURCE vertex groups and old UV maps from all results
     for obj in separated_objs:
-        vertex_count = len(obj.data.vertices)
-        for meta in metadata:
-            if abs(meta['vertex_count'] - vertex_count) < 5:  # Tolerance for triangulation
-                obj.name = meta['original_name'] + "_Baked"
-                break
+        # Remove tagging vertex groups
+        groups_to_remove = [vg for vg in obj.vertex_groups if vg.name.startswith("BAKE_SOURCE_")]
+        for vg in groups_to_remove:
+            obj.vertex_groups.remove(vg)
         
         # Remove old UV maps, keep only the baked atlas UV
         mesh = obj.data
@@ -584,7 +622,7 @@ def cleanup_bake_nodes(obj):
 def run_pipeline(objects, export_dir, resolution=1024, shader_name="MeshGloss.fx", 
                 dds_format_diffuse='BC1_UNORM', dds_format_normal='BC3_UNORM',
                 alpha_mode='CONSTANT', alpha_value=255, use_bc1_alpha_flag=True,
-                mipmap_levels=9):
+                mipmap_levels=9, collection_name=None):
     """
     Main entry point for the baking pipeline.
     Supports both single object and multi-object atlas baking.
@@ -592,6 +630,8 @@ def run_pipeline(objects, export_dir, resolution=1024, shader_name="MeshGloss.fx
     Args:
         objects: Single object or list of objects to bake
         export_dir: Directory to save textures
+        collection_name: Used as the texture base name for multi-object atlas bakes.
+                         Falls back to the first object's name if not provided.
         ... (other parameters as before)
     
     Returns:
@@ -613,10 +653,13 @@ def run_pipeline(objects, export_dir, resolution=1024, shader_name="MeshGloss.fx
     
     texture_results = {}
     
-    # Determine base filename
-    base_name = objects[0].name
+    # Determine base filename.
+    # Multi-object atlas uses the collection name so the texture is clearly
+    # associated with the group rather than whichever object happened to be first.
     if is_multi:
-        base_name = base_name + "_Atlas"
+        base_name = (collection_name or objects[0].name) + "_Atlas"
+    else:
+        base_name = objects[0].name
     
     # 3. Bake each pass
     for bake_type, image in images.items():
