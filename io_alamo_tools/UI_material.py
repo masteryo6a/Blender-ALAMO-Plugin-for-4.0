@@ -166,12 +166,34 @@ class ALAMO_OT_BakeTextures(bpy.types.Operator):
             self.report({'ERROR'}, "No mesh objects selected")
             return {'CANCELLED'}
         
-        # Use export path if available, or current file path
+        # Resolve texture output directory: <blend dir>\Data\Art\Textures
         if bpy.data.filepath:
-            export_dir = os.path.dirname(bpy.data.filepath)
+            blend_dir = os.path.dirname(bpy.data.filepath)
         else:
-            export_dir = os.path.expanduser("~")  # Fallback to home
-            
+            blend_dir = os.path.expanduser("~")  # Fallback to home when file is unsaved
+
+        export_dir = os.path.join(blend_dir, "Data", "Art", "Textures")
+        os.makedirs(export_dir, exist_ok=True)
+
+        # Find the collection that contains the selected objects.
+        # Walk all collections in the scene and pick the deepest one that
+        # holds at least one of the selected meshes.
+        def find_collection_for_objects(objs, root_collection):
+            obj_set = set(objs)
+            best = root_collection.name
+            def walk(col):
+                nonlocal best
+                if any(o in obj_set for o in col.objects):
+                    best = col.name
+                for child in col.children:
+                    walk(child)
+            walk(root_collection)
+            return best
+
+        collection_name = find_collection_for_objects(
+            selected_meshes, context.scene.collection
+        )
+
         res = int(context.scene.alamo_bake_res)
         shader = context.scene.alamo_bake_shader
         dds_diff = context.scene.alamo_bake_dds_diffuse
@@ -187,18 +209,19 @@ class ALAMO_OT_BakeTextures(bpy.types.Operator):
         if len(selected_meshes) == 1:
             self.report({'INFO'}, f"Starting single object bake at {res}px with alpha={alpha_value}...")
         else:
-            self.report({'INFO'}, f"Starting atlas bake for {len(selected_meshes)} objects at {res}px...")
+            self.report({'INFO'}, f"Starting atlas bake for {len(selected_meshes)} objects at {res}px (collection: '{collection_name}')...")
         
         try:
             baked_objs, results = bake_pipeline.run_pipeline(
-                selected_meshes,  # Pass list of objects
-                export_dir, 
-                resolution=res, 
+                selected_meshes,
+                export_dir,
+                resolution=res,
                 shader_name=shader,
                 dds_format_diffuse=dds_diff,
                 dds_format_normal=dds_norm,
                 alpha_mode=alpha_mode,
-                alpha_value=alpha_value
+                alpha_value=alpha_value,
+                collection_name=collection_name,
             )
             
             if len(selected_meshes) == 1:
@@ -207,7 +230,7 @@ class ALAMO_OT_BakeTextures(bpy.types.Operator):
                 else:
                     self.report({'INFO'}, f"Bake finished (alpha={alpha_value}). New object: {baked_objs[0].name}")
             else:
-                self.report({'INFO'}, f"Atlas bake finished! Created {len(baked_objs)} objects with shared texture")
+                self.report({'INFO'}, f"Atlas bake finished! {len(baked_objs)} objects, textures in: {export_dir}")
                 
         except Exception as e:
             self.report({'ERROR'}, f"Bake failed: {str(e)}")
