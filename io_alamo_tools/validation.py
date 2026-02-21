@@ -230,6 +230,8 @@ def checkProxyKeyframes():
 
 def validate(mesh_list):
     errors = []
+    error_objects = set()  # Track objects with errors
+    
     checklist = [
         checkShadowMesh,
         checkUV,
@@ -245,16 +247,34 @@ def validate(mesh_list):
         checkTranslationArmature,
         checkBoneNames,
         checkBoneCount,
-        # checkProxyKeyframes, # Disabled until it can be fixed
     ]
 
+    # Process Meshes
     for check in checklist:
         for object in mesh_list:
-            errors += check(object)
+            check_errors = check(object)
+            if check_errors:
+                errors += check_errors
+                error_objects.add(object)
     
     errors += checkActiveSkeleton(mesh_list)
     
+    # Process Global/Armature checks
     for check in checklist_no_object:
-        errors += check()
+        check_errors = check()
+        if check_errors:
+            errors += check_errors
+            # NEW: If an armature check fails, add the armature to the selection set
+            armature = utils.findArmature()
+            if armature:
+                error_objects.add(armature)
+    
+    # Select all objects with errors (now including Armatures)
+    if error_objects:
+        bpy.ops.object.select_all(action='DESELECT')
+        for obj in error_objects:
+            obj.select_set(True)
+        # Set first error object as active
+        bpy.context.view_layer.objects.active = list(error_objects)[0]
 
     return errors
