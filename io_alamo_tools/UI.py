@@ -6,6 +6,7 @@ from bpy.props import (
     PointerProperty,
 )
 from . import validation
+from . import apply_transforms
 from . import utils
 import mathutils
 import bpy
@@ -185,6 +186,36 @@ class ValidateFileButton(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class ApplyTransformsButton(bpy.types.Operator):
+    bl_idname = "alamo.apply_transforms"
+    bl_label = "Apply Transforms"
+    bl_description = "Apply location and scale to selected Meshes and Armatures"
+
+    def execute(self, context):
+        # FIX: Include 'ARMATURE' in the filtered list
+        selected_objects = [obj for obj in context.selected_objects if obj.type in {'MESH', 'ARMATURE'}]
+        
+        if not selected_objects:
+            # FIX: Update warning text for clarity
+            self.report({'WARNING'}, "No mesh or armature objects selected")
+            return {'CANCELLED'}
+        
+        # Call the apply_transforms module
+        processed_count, flipped_count = apply_transforms.apply_transforms_to_objects(selected_objects)
+        
+        # Report results
+        if processed_count == 0:
+            self.report({'WARNING'}, "No objects processed")
+            return {'CANCELLED'}
+        
+        msg = f"Applied transforms to {processed_count} object(s)"
+        if flipped_count > 0:
+            msg += f", flipped normals on {flipped_count} mesh(es)"
+        
+        self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+
 # Legacy version, included for the debug panel
 class createConstraintBoneButton(bpy.types.Operator):
     bl_idname = "create.constraint_bone"
@@ -297,6 +328,10 @@ class ALAMO_PT_SettingsPanel(bpy.types.Panel):
 
         row = layout.row()
         row.operator("alamo.validate_file")
+        row.scale_y = 3.0
+
+        row = layout.row()
+        row.operator("alamo.apply_transforms")
         row.scale_y = 3.0
 
         layout.separator()
@@ -561,6 +596,7 @@ classes = (
     skeletonEnumClass,
     billboardListProperties,
     ValidateFileButton,
+    ApplyTransformsButton,
     CreateConstraintBone,
     createConstraintBoneButton,
     CopyProxyNameToSelected,
